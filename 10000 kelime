@@ -1,0 +1,332 @@
+import json
+import os
+import time
+import numpy as np
+
+# ==============================================================================
+# 1. ~10.000 KELİMELİK ÖĞRETİCİ METİN ÜRETİCİ
+# ==============================================================================
+BASE_LESSONS = [
+    (
+        "yapay sinir aglari veriden oruntu ogrenir her katman girdiyi donusturur "
+        "agirliklar ve bias degerleri tahmin hatasi azaldikca ayarlanir ogrenme "
+        "sureci ileri yayilim ve geri yayilim adimlarindan olusur ileri yayilimda "
+        "girdi gizli duruma aktarilir ve cikti olasiliklari hesaplanir geri yayilimda "
+        "ise kayip fonksiyonunun turevi katmanlar boyunca geriye dogru tasinir"
+    ),
+    (
+        "gradyan inisi model parametrelerini kaybi azaltacak yonde gunceller "
+        "ogrenme orani cok buyuk olursa parametreler optimum noktanin etrafinda "
+        "sicrayabilir ogrenme orani cok kucuk olursa egitim cok yavas ilerler "
+        "adam optimizatoru birinci ve ikinci moment tahminlerini kullanarak her "
+        "parametre icin daha dengeli bir guncelleme adimi saglar"
+    ),
+    (
+        "tekrarlayan sinir aglari sirali verilerle calisir onceki adimin gizli "
+        "durumu sonraki adima baglam tasir karakter tabanli modeller harf ve "
+        "bosluk istatistiklerini ogrenerek yeni diziler uretebilir ancak uzun "
+        "dizilerde gradyan kaybolmasi veya patlamasi gorulebilir gradyan kirpma "
+        "bu patlamalari sinirlayarak egitimi daha kararli hale getirir"
+    ),
+    (
+        "aktivasyon fonksiyonlari agin dogrusal olmayan iliskileri ogrenmesini "
+        "saglar hiperbolik tanjant yani tanh ciktilari eksi bir ile artı bir "
+        "arasina sikistirir softmax fonksiyonu ise cikti skorlarini toplamı "
+        "bir olan olasilik dagilimina cevirir capraz entropi kaybi dogru "
+        "sinifin olasiligi dustukce cezayi artirir"
+    ),
+    (
+        "veri kalitesi ve cesitliligi model performansini dogrudan etkiler "
+        "temiz ve tutarli egitim metinleri modelin kelime ve cumle yapisini "
+        "daha iyi kavramasina yardim eder kucuk modellerde egitim suresi ile "
+        "hafiza kapasitesi arasinda denge kurulmalidir gizli katman boyutu "
+        "arttikca ifade gucu artar fakat islem maliyeti de yukselir"
+    ),
+    (
+        "python okunabilirligi yuksek ve zengin kutuphanelere sahip bir dildir "
+        "numpy cok boyutlu diziler ve vektorize islemler icin temel arac sunar "
+        "matematiksel islemleri saf python donguleri yerine numpy ile yapmak "
+        "kodun hem daha kisa hem daha hizli olmasini saglar mobil cihazlarda "
+        "calisirken gereksiz bellek kopyalarindan kacinmak performansi korur"
+    ),
+    (
+        "uretim asamasinda sicaklik yani temperature parametresi secim dagilimini "
+        "sekillendirir dusuk sicaklik daha yuksek olasilikli karakterleri one "
+        "cikararak daha tutarli sonuclar verir yuksek sicaklik ise daha fazla "
+        "cesitlilik ve surpriz saglar dogru denge modelin hem ogrendigini "
+        "kullanmasini hem de tekrarlara saplanmamasini destekler"
+    ),
+    (
+        "kodlari moduler ve tekrar calistirilabilir sekilde yazmak buyuk "
+        "projelerde hata ayiklamayi kolaylastirir egitilmis agirliklari diske "
+        "kaydetmek her calistirmada sifirdan egitim yapma zorunlulugunu ortadan "
+        "kaldirir bulut ortamlarinda ise gecici disk yerine kalici depolama "
+        "veya surum kontrolu ile agirliklari guvenli tutmak gerekir"
+    ),
+]
+
+
+def build_ten_thousand_word_corpus(target_words: int = 10000) -> str:
+    """Öğretici ders bloklarını birleştirerek ~10.000 kelimelik metin üretir."""
+    chunks = []
+    current_words = 0
+    lesson_idx = 0
+    total_lessons = len(BASE_LESSONS)
+
+    while current_words < target_words:
+        lesson = BASE_LESSONS[lesson_idx % total_lessons]
+        lesson_words = lesson.split()
+        remaining = target_words - current_words
+
+        if len(lesson_words) <= remaining:
+            chunks.append(lesson)
+            current_words += len(lesson_words)
+        else:
+            chunks.append(" ".join(lesson_words[:remaining]))
+            current_words += remaining
+
+        lesson_idx += 1
+
+    return " ".join(chunks)
+
+
+# ==============================================================================
+# 2. DİZİN VE DOSYA YOLLARI
+# ==============================================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+WEIGHT_FILES = {
+    "Wxh": os.path.join(BASE_DIR, "Wxh.npy"),
+    "Whh": os.path.join(BASE_DIR, "Whh.npy"),
+    "Why": os.path.join(BASE_DIR, "Why.npy"),
+    "bh": os.path.join(BASE_DIR, "bh.npy"),
+    "by": os.path.join(BASE_DIR, "by.npy"),
+}
+VOCAB_FILE = os.path.join(BASE_DIR, "vocab.json")
+
+
+# ==============================================================================
+# 3. VERİ HAZIRLIK
+# ==============================================================================
+text = build_ten_thousand_word_corpus(target_words=10000)
+word_count = len(text.split())
+
+if os.path.exists(VOCAB_FILE):
+    with open(VOCAB_FILE, "r", encoding="utf-8") as f:
+        chars = json.load(f)
+else:
+    chars = sorted(list(set(text)))
+
+char_to_idx = {ch: i for i, ch in enumerate(chars)}
+idx_to_char = {i: ch for i, ch in enumerate(chars)}
+vocab_size = len(chars)
+
+# Metindeki bilinmeyen karakterleri güvenli şekilde eşle
+fallback_idx = 0
+data = np.array([char_to_idx.get(ch, fallback_idx) for ch in text], dtype=np.int32)
+
+print(f"Öğretici kelime sayısı (söz): {word_count}")
+print(f"Toplam karakter uzunluğu: {len(text)}")
+print(f"Benzersiz karakter sayısı (vocab): {vocab_size}")
+
+
+# ==============================================================================
+# 4. MODEL PARAMETRELERİ VE OPTİMİZE İŞLEMLER
+# ==============================================================================
+HIDDEN_SIZE = 64
+SEQ_LEN = 16
+LEARNING_RATE = 0.004
+EPOCHS = 300  # 10.000 kelimelik korpusta mobilde hızlı ve dengeli eğitim için
+
+
+def init_weights(hidden_size: int, vocab_size: int, seed: int = 42):
+    rng = np.random.default_rng(seed)
+    scale = 0.05
+    Wxh = rng.standard_normal((hidden_size, vocab_size)) * scale
+    Whh = rng.standard_normal((hidden_size, hidden_size)) * scale
+    Why = rng.standard_normal((vocab_size, hidden_size)) * scale
+    bh = np.zeros((hidden_size, 1), dtype=np.float64)
+    by = np.zeros((vocab_size, 1), dtype=np.float64)
+    return Wxh, Whh, Why, bh, by
+
+
+def weights_exist() -> bool:
+    return os.path.exists(VOCAB_FILE) and all(os.path.exists(p) for p in WEIGHT_FILES.values())
+
+
+def save_model(Wxh, Whh, Why, bh, by, chars_list):
+    np.save(WEIGHT_FILES["Wxh"], Wxh)
+    np.save(WEIGHT_FILES["Whh"], Whh)
+    np.save(WEIGHT_FILES["Why"], Why)
+    np.save(WEIGHT_FILES["bh"], bh)
+    np.save(WEIGHT_FILES["by"], by)
+    with open(VOCAB_FILE, "w", encoding="utf-8") as f:
+        json.dump(chars_list, f, ensure_ascii=False)
+
+
+def load_model():
+    Wxh = np.load(WEIGHT_FILES["Wxh"])
+    Whh = np.load(WEIGHT_FILES["Whh"])
+    Why = np.load(WEIGHT_FILES["Why"])
+    bh = np.load(WEIGHT_FILES["bh"])
+    by = np.load(WEIGHT_FILES["by"])
+    return Wxh, Whh, Why, bh, by
+
+
+def softmax(logits: np.ndarray) -> np.ndarray:
+    shifted = logits - np.max(logits, axis=0, keepdims=True)
+    exp_vals = np.exp(shifted)
+    return exp_vals / np.sum(exp_vals, axis=0, keepdims=True)
+
+
+def forward(inputs, h_prev, Wxh, Whh, Why, bh, by):
+    """One-hot çarpımı yerine doğrudan sütun indeksleme ile hızlandırılmış forward."""
+    hs = {-1: h_prev}
+    ps = {}
+    t_len = len(inputs)
+
+    for t in range(t_len):
+        idx = inputs[t]
+        # Wxh[:, idx] şekli (HIDDEN_SIZE,) -> (HIDDEN_SIZE, 1)
+        x_proj = Wxh[:, idx : idx + 1]
+        hs[t] = np.tanh(x_proj + Whh @ hs[t - 1] + bh)
+        logits = Why @ hs[t] + by
+        ps[t] = softmax(logits)
+
+    return hs, ps
+
+
+def backward(inputs, hs, ps, targets, Wxh, Whh, Why):
+    dWxh = np.zeros_like(Wxh)
+    dWhh = np.zeros_like(Whh)
+    dWhy = np.zeros_like(Why)
+    dbh = np.zeros((HIDDEN_SIZE, 1), dtype=np.float64)
+    dby = np.zeros((vocab_size, 1), dtype=np.float64)
+    dh_next = np.zeros((HIDDEN_SIZE, 1), dtype=np.float64)
+    loss = 0.0
+
+    for t in reversed(range(len(inputs))):
+        target_idx = targets[t]
+        prob = ps[t][target_idx, 0]
+        loss += -np.log(prob + 1e-12)
+
+        dy = ps[t].copy()
+        dy[target_idx, 0] -= 1.0
+
+        dWhy += dy @ hs[t].T
+        dby += dy
+
+        dh = Why.T @ dy + dh_next
+        dh_raw = (1.0 - hs[t] ** 2) * dh
+        dbh += dh_raw
+
+        inp_idx = inputs[t]
+        dWxh[:, inp_idx : inp_idx + 1] += dh_raw
+        dWhh += dh_raw @ hs[t - 1].T
+
+        dh_next = Whh.T @ dh_raw
+
+    for grad in (dWxh, dWhh, dWhy, dbh, dby):
+        np.clip(grad, -5.0, 5.0, out=grad)
+
+    return dWxh, dWhh, dWhy, dbh, dby, loss
+
+
+def train_model(epochs: int = EPOCHS, lr: float = LEARNING_RATE):
+    Wxh, Whh, Why, bh, by = init_weights(HIDDEN_SIZE, vocab_size)
+
+    m_Wxh, v_Wxh = np.zeros_like(Wxh), np.zeros_like(Wxh)
+    m_Whh, v_Whh = np.zeros_like(Whh), np.zeros_like(Whh)
+    m_Why, v_Why = np.zeros_like(Why), np.zeros_like(Why)
+    m_bh, v_bh = np.zeros_like(bh), np.zeros_like(bh)
+    m_by, v_by = np.zeros_like(by), np.zeros_like(by)
+
+    beta1, beta2, eps = 0.9, 0.999, 1e-8
+    step = 0
+    start_time = time.time()
+
+    def adam_step(param, grad, m, v, t_step, current_lr):
+        m[:] = beta1 * m + (1.0 - beta1) * grad
+        v[:] = beta2 * v + (1.0 - beta2) * (grad * grad)
+        m_hat = m / (1.0 - beta1 ** t_step)
+        v_hat = v / (1.0 - beta2 ** t_step)
+        param -= current_lr * m_hat / (np.sqrt(v_hat) + eps)
+
+    max_start = len(data) - SEQ_LEN - 1
+    print(f"Eğitim başlıyor ({epochs} epoch, seq_len={SEQ_LEN})...")
+
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+        h = np.zeros((HIDDEN_SIZE, 1), dtype=np.float64)
+        current_lr = lr * (0.97 ** (epoch // 50))
+
+        for i in range(0, max_start, SEQ_LEN):
+            step += 1
+            inputs = data[i : i + SEQ_LEN]
+            targets = data[i + 1 : i + SEQ_LEN + 1]
+
+            hs, ps = forward(inputs, h, Wxh, Whh, Why, bh, by)
+            dWxh, dWhh, dWhy, dbh, dby, loss = backward(inputs, hs, ps, targets, Wxh, Whh, Why)
+
+            adam_step(Wxh, dWxh, m_Wxh, v_Wxh, step, current_lr)
+            adam_step(Whh, dWhh, m_Whh, v_Whh, step, current_lr)
+            adam_step(Why, dWhy, m_Why, v_Why, step, current_lr)
+            adam_step(bh, dbh, m_bh, v_bh, step, current_lr)
+            adam_step(by, dby, m_by, v_by, step, current_lr)
+
+            h = hs[SEQ_LEN - 1]
+            total_loss += loss
+
+        if epoch == 1 or epoch % 50 == 0 or epoch == epochs:
+            elapsed = time.time() - start_time
+            avg_loss = total_loss / max(1, (max_start // SEQ_LEN))
+            print(f"Epoch {epoch:3d}/{epochs} | Ort. Loss: {avg_loss:.4f} | Süre: {elapsed:.1f}s")
+
+    save_model(Wxh, Whh, Why, bh, by, chars)
+    print("Eğitim tamamlandı ve ağırlıklar kaydedildi.")
+    return Wxh, Whh, Why, bh, by
+
+
+# ==============================================================================
+# 5. METİN ÜRETİMİ
+# ==============================================================================
+def generate_text(
+    Wxh,
+    Whh,
+    Why,
+    bh,
+    by,
+    start_char: str = "y",
+    length: int = 180,
+    temperature: float = 0.7,
+) -> str:
+    temp = max(temperature, 1e-3)
+    idx = char_to_idx.get(start_char, 0)
+    h = np.zeros((HIDDEN_SIZE, 1), dtype=np.float64)
+    out_chars = [idx_to_char[idx]]
+
+    for _ in range(length):
+        x_proj = Wxh[:, idx : idx + 1]
+        h = np.tanh(x_proj + Whh @ h + bh)
+        logits = (Why @ h + by) / temp
+        probs = softmax(logits).ravel()
+        idx = int(np.random.choice(vocab_size, p=probs))
+        out_chars.append(idx_to_char[idx])
+
+    return "".join(out_chars)
+
+
+# ==============================================================================
+# 6. ÇALIŞTIRMA AKIŞI
+# ==============================================================================
+force_retrain = os.environ.get("RETRAIN", "0") == "1"
+
+if force_retrain or not weights_exist():
+    Wxh, Whh, Why, bh, by = train_model(epochs=EPOCHS, lr=LEARNING_RATE)
+else:
+    print("Kayıtlı ağırlıklar bulundu, yükleniyor...")
+    Wxh, Whh, Why, bh, by = load_model()
+
+print("\n--- Öğretici Modelden Örnek Çıktılar ---")
+print("[Temp 0.6]:", generate_text(Wxh, Whh, Why, bh, by, start_char="y", length=160, temperature=0.6))
+print("[Temp 0.8]:", generate_text(Wxh, Whh, Why, bh, by, start_char="g", length=160, temperature=0.8))
+
