@@ -460,3 +460,450 @@ def admin_panel():
 if __name__ == "__main__":
     import os
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+import json
+import os
+import time
+import numpy as np
+from flask import Flask, jsonify, render_template_string, request
+
+app = Flask(__name__)
+
+# ==============================================================================
+# 1. DOSYA YOLLARI VE VARSAYILAN ÖĞRETİCİ VERİ SETİ
+# ==============================================================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+DATA_FILE = os.path.join(BASE_DIR, "corpus.txt")
+VOCAB_FILE = os.path.join(BASE_DIR, "vocab.json")
+WEIGHT_FILES = {
+    "Wxh": os.path.join(BASE_DIR, "Wxh.npy"),
+    "Whh": os.path.join(BASE_DIR, "Whh.npy"),
+    "Why": os.path.join(BASE_DIR, "Why.npy"),
+    "bh": os.path.join(BASE_DIR, "bh.npy"),
+    "by": os.path.join(BASE_DIR, "by.npy"),
+}
+
+DEFAULT_CORPUS = """selam ben mini ai seninle birlikte ogreniyorum
+merhaba nasilsin ben yapay sinir agi ile calisiyorum
+selamlar hos geldin hangi konuda devam edelim
+yapay zeka veriden oruntu ogrenir her katman girdiyi isler
+gradyan inisi hatayi azaltmak icin agirliklari gunceller
+adam optimizatoru ogrenme adimlarini dengeler ve kararlilik saglar
+tekrarlayan sinir aglari sirali veride onceki durumu sonraki adima tasir
+gradyan kirpma asiri buyuk turevleri sinirlayarak egitimi korur
+softmax skorlari olasilik dagilimina cevirir temperature secimi ayarlar
+model agirliklarini kaydetmek her seferinde bastan egitmeyi onler
+"""
+
+HIDDEN_SIZE = 72
+SEQ_LEN = 16
+DEFAULT_LR = 0.003
+DEFAULT_EPOCHS = 180
+
+
+def load_or_init_corpus() -> str:
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if content:
+                return content
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        f.write(DEFAULT_CORPUS)
+    return DEFAULT_CORPUS
+
+
+def save_corpus(text: str) -> None:
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def build_vocab_from_text(text: str):
+    chars = sorted(list(set(text)))
+    char_to_idx = {ch: i for i, ch in enumerate(chars)}
+    idx_to_char = {i: ch for i, ch in enumerate(chars)}
+    return chars, char_to_idx, idx_to_char
+
+
+def init_weights(hidden_size: int, vocab_size: int, seed: int = 42):
+    rng = np.random.default_rng(seed)
+    Wxh = rng.standard_normal((hidden_size, vocab_size)) * np.sqrt(1.0 / max(1, vocab_size))
+    Whh = rng.standard_normal((hidden_size, hidden_size)) * np.sqrt(1.0 / max(1, hidden_size))
+    Why = rng.standard_normal((vocab_size, hidden_size)) * np.sqrt(1.0 / max(1, hidden_size))
+    bh = np.zeros((hidden_size, 1), dtype=np.float64)
+    by = np.zeros((vocab_size, 1), dtype=np.float64)
+    return Wxh, Whh, Why, bh, by
+
+
+def weights_complete() -> bool:
+    return os.path.exists(VOCAB_FILE) and all(os.path.exists(p) for p in WEIGHT_FILES.values())
+
+
+def save_weights_and_vocab(Wxh, Whh, Why, bh, by, chars_list):
+    np.save(WEIGHT_FILES["Wxh"], Wxh)
+    np.save(WEIGHT_FILES["Whh"], Whh)
+    np.save(WEIGHT_FILES["Why"], Why)
+    np.save(WEIGHT_FILES["bh"], bh)
+    np.save(WEIGHT_FILES["by"], by)
+    with open(VOCAB_FILE, "w", encoding="utf-8") as f:
+        json.dump(chars_list, f, ensure_ascii=False)
+
+
+def load_weights_and_vocab():
+    with open(VOCAB_FILE, "r", encoding="utf-8") as f:
+        chars_list = json.load(f)
+    Wxh = np.load(WEIGHT_FILES["Wxh"])
+    Whh = np.load(WEIGHT_FILES["Whh"])
+    Why = np.load(WEIGHT_FILES["Why"])
+    bh = np.load(WEIGHT_FILES["bh"])
+    by = np.load(WEIGHT_FILES["by"])
+    return Wxh, Whh, Why, bh, by, chars_list
+
+
+def expand_weights_if_needed(Wxh, Why, by, old_chars, new_chars):
+    """Yeni karakter eklendiyse mevcut ağırlıkları koruyarak vocab boyutunu büyütür."""
+    if old_chars == new_chars:
+        return Wxh, Why, by
+
+    old_map = {ch: i for i, ch in enumerate(old_chars)}
+    new_vocab = len(new_chars)
+    hidden_dim = Wxh.shape[0]
+    rng = np.random.default_rng(42)
+
+    new_Wxh = rng.standard_normal((hidden_dim, new_vocab)) * np.sqrt(1.0 / max(1, new_vocab))
+    new_Why = rng.standard_normal((new_vocab, hidden_dim)) * np.sqrt(1.0 / max(1, hidden_dim))
+    new_by = np.zeros((new_vocab, 1), dtype=np.float64)
+
+    for new_i, ch in enumerate(new_chars):
+        if ch in old_map:
+            old_i = old_map[ch]
+            if old_i < Wxh.shape[1] and old_i < Why.shape[0]:
+                new_Wxh[:, new_i : new_i + 1] = Wxh[:, old_i : old_i + 1]
+                new_Why[new_i : new_i + 1, :] = Why[old_i : old_i + 1, :]
+                new_by[new_i : new_i + 1, :] = by[old_i : old_i + 1, :]
+
+    return new_Wxh, new_Why, new_by
+
+
+# ==============================================================================
+# 2. İLERİ / GERİ YAYILIM VE EĞİTİM
+# ==============================================================================
+def softmax(logits: np.ndarray) -> np.ndarray:
+    shifted = logits - np.max(logits, axis=0, keepdims=True)
+    exp_vals = np.exp(shifted)
+    total = np.sum(exp_vals, axis=0, keepdims=True)
+    return exp_vals / np.maximum(total, 1e-12)
+
+
+def forward(inputs, h_prev, Wxh, Whh, Why, bh, by):
+    hs = {-1: h_prev}
+    ps = {}
+    for t in range(len(inputs)):
+        idx = inputs[t]
+        hs[t] = np.tanh(Wxh[:, idx : idx + 1] + Whh @ hs[t - 1] + bh)
+        ps[t] = softmax(Why @ hs[t] + by)
+    return hs, ps
+
+
+def backward(inputs, hs, ps, targets, Whh, Why, vocab_size):
+    dWxh = np.zeros((HIDDEN_SIZE, vocab_size), dtype=np.float64)
+    dWhh = np.zeros_like(Whh)
+    dWhy = np.zeros_like(Why)
+    dbh = np.zeros((HIDDEN_SIZE, 1), dtype=np.float64)
+    dby = np.zeros((vocab_size, 1), dtype=np.float64)
+    dh_next = np.zeros((HIDDEN_SIZE, 1), dtype=np.float64)
+    loss = 0.0
+
+    for t in reversed(range(len(inputs))):
+        target_idx = targets[t]
+        loss += -np.log(max(float(ps[t][target_idx, 0]), 1e-12))
+
+        dy = ps[t].copy()
+        dy[target_idx, 0] -= 1.0
+
+        dWhy += dy @ hs[t].T
+        dby += dy
+
+        dh = Why.T @ dy + dh_next
+        dh_raw = (1.0 - hs[t] ** 2) * dh
+        dbh += dh_raw
+
+        inp_idx = inputs[t]
+        dWxh[:, inp_idx : inp_idx + 1] += dh_raw
+        dWhh += dh_raw @ hs[t - 1].T
+        dh_next = Whh.T @ dh_raw
+
+    for grad in (dWxh, dWhh, dWhy, dbh, dby):
+        np.clip(grad, -3.0, 3.0, out=grad)
+
+    return dWxh, dWhh, dWhy, dbh, dby, loss
+
+
+def run_training(corpus_text: str, Wxh, Whh, Why, bh, by, chars_list, epochs: int, lr: float):
+    _, c2i, _ = build_vocab_from_text(corpus_text)
+    vocab_size = len(chars_list)
+    data = np.array([c2i[ch] for ch in corpus_text if ch in c2i], dtype=np.int32)
+
+    seq_len = min(SEQ_LEN, max(4, len(data) - 2))
+    max_start = max(1, len(data) - seq_len - 1)
+    batches = max(1, max_start // seq_len)
+
+    m_Wxh, v_Wxh = np.zeros_like(Wxh), np.zeros_like(Wxh)
+    m_Whh, v_Whh = np.zeros_like(Whh), np.zeros_like(Whh)
+    m_Why, v_Why = np.zeros_like(Why), np.zeros_like(Why)
+    m_bh, v_bh = np.zeros_like(bh), np.zeros_like(bh)
+    m_by, v_by = np.zeros_like(by), np.zeros_like(by)
+
+    beta1, beta2, eps = 0.9, 0.999, 1e-8
+    step = 0
+    best_loss = float("inf")
+    best_weights = (Wxh.copy(), Whh.copy(), Why.copy(), bh.copy(), by.copy())
+    t0 = time.time()
+
+    def adam_update(param, grad, m, v, t_step, cur_lr):
+        m[:] = beta1 * m + (1.0 - beta1) * grad
+        v[:] = beta2 * v + (1.0 - beta2) * (grad * grad)
+        m_hat = m / (1.0 - (beta1 ** t_step))
+        v_hat = v / (1.0 - (beta2 ** t_step))
+        param -= cur_lr * m_hat / (np.sqrt(v_hat) + eps)
+
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+        h = np.zeros((HIDDEN_SIZE, 1), dtype=np.float64)
+        cur_lr = lr * (0.98 ** (epoch // 30))
+
+        for i in range(0, max_start, seq_len):
+            step += 1
+            inputs = data[i : i + seq_len]
+            targets = data[i + 1 : i + seq_len + 1]
+
+            hs, ps = forward(inputs, h, Wxh, Whh, Why, bh, by)
+            dWxh, dWhh, dWhy, dbh, dby, loss = backward(inputs, hs, ps, targets, Whh, Why, vocab_size)
+
+            adam_update(Wxh, dWxh, m_Wxh, v_Wxh, step, cur_lr)
+            adam_update(Whh, dWhh, m_Whh, v_Whh, step, cur_lr)
+            adam_update(Why, dWhy, m_Why, v_Why, step, cur_lr)
+            adam_update(bh, dbh, m_bh, v_bh, step, cur_lr)
+            adam_update(by, dby, m_by, v_by, step, cur_lr)
+
+            h = 0.9 * hs[seq_len - 1]
+            total_loss += loss
+
+        avg_loss = total_loss / batches
+        if np.isfinite(avg_loss) and avg_loss < best_loss:
+            best_loss = avg_loss
+            best_weights = (Wxh.copy(), Whh.copy(), Why.copy(), bh.copy(), by.copy())
+
+    Wxh, Whh, Why, bh, by = best_weights
+    save_weights_and_vocab(Wxh, Whh, Why, bh, by, chars_list)
+    return Wxh, Whh, Why, bh, by, best_loss, round(time.time() - t0, 2)
+
+
+# ==============================================================================
+# 3. KARARLI METİN ÜRETİMİ
+# ==============================================================================
+def sample_top_k(logits: np.ndarray, temperature: float = 0.45, top_k: int = 5) -> int:
+    temp = max(float(temperature), 0.1)
+    scaled = (logits.ravel() / temp).astype(np.float64)
+    k = min(max(1, int(top_k)), len(scaled))
+    top_idx = np.argpartition(scaled, -k)[-k:]
+    top_logits = scaled[top_idx] - np.max(scaled[top_idx])
+    probs = np.exp(top_logits)
+    probs = probs / np.sum(probs)
+    return int(np.random.choice(top_idx, p=probs))
+
+
+def generate_continuation(
+    prompt_text: str,
+    Wxh,
+    Whh,
+    Why,
+    bh,
+    by,
+    chars_list,
+    length: int = 90,
+    temperature: float = 0.45,
+    top_k: int = 5,
+) -> str:
+    _, c2i, i2c = build_vocab_from_text("".join(chars_list))
+    vocab_size = len(chars_list)
+    h = np.zeros((HIDDEN_SIZE, 1), dtype=np.float64)
+
+    clean_prompt = (prompt_text or "").strip().lower()
+    valid_chars = [ch for ch in clean_prompt if ch in c2i]
+
+    if not valid_chars:
+        valid_chars = [ch for ch in "selam " if ch in c2i] or [chars_list[0]]
+
+    out = []
+    for ch in valid_chars:
+        idx = c2i[ch]
+        out.append(ch)
+        h = np.tanh(Wxh[:, idx : idx + 1] + Whh @ h + bh)
+
+    # Kelime/cümle bütünlüğü için son karakterden sonra boşluk yoksa hafif bağlam ver
+    if out[-1] != " " and " " in c2i:
+        sp_idx = c2i[" "]
+        out.append(" ")
+        h = np.tanh(Wxh[:, sp_idx : sp_idx + 1] + Whh @ h + bh)
+
+    last_idx = c2i[out[-1]]
+    for _ in range(max(10, min(int(length), 300))):
+        h = np.tanh(Wxh[:, last_idx : last_idx + 1] + Whh @ h + bh)
+        logits = Why @ h + by
+        next_idx = sample_top_k(logits, temperature=temperature, top_k=top_k)
+        if next_idx < vocab_size:
+            out.append(i2c[next_idx])
+            last_idx = next_idx
+
+    return "".join(out)
+
+
+# ==============================================================================
+# 4. BAŞLANGIÇ YÜKLEME / İLK EĞİTİM
+# ==============================================================================
+corpus_text = load_or_init_corpus()
+chars, char_to_idx, idx_to_char = build_vocab_from_text(corpus_text)
+
+if weights_complete():
+    Wxh, Whh, Why, bh, by, saved_chars = load_weights_and_vocab()
+    merged_chars = sorted(list(set(saved_chars).union(set(chars))))
+    Wxh, Why, by = expand_weights_if_needed(Wxh, Why, by, saved_chars, merged_chars)
+    chars = merged_chars
+    save_weights_and_vocab(Wxh, Whh, Why, bh, by, chars)
+else:
+    Wxh, Whh, Why, bh, by = init_weights(HIDDEN_SIZE, len(chars))
+    # İlk açılışta ağırlık yoksa kısa bir ön eğitim yapıp kaydet
+    Wxh, Whh, Why, bh, by, _, _ = run_training(
+        corpus_text, Wxh, Whh, Why, bh, by, chars, epochs=120, lr=DEFAULT_LR
+    )
+
+
+# ==============================================================================
+# 5. WEB ARAYÜZÜ VE API UÇLARI
+# ==============================================================================
+HTML_PAGE = """
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mini AI</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #111318; color: #f3f4f6; margin: 0; padding: 20px; }
+    .box { max-width: 520px; margin: auto; background: #1b1f27; padding: 20px; border-radius: 12px; }
+    textarea { width: 100%; height: 90px; border-radius: 8px; border: 1px solid #374151; background: #111318; color: #fff; padding: 10px; box-sizing: border-box; }
+    button { width: 100%; padding: 12px; margin-top: 10px; border: 0; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; }
+    .btn-gen { background: #16a34a; color: #fff; }
+    .btn-train { background: #2563eb; color: #fff; }
+    .out { margin-top: 16px; background: #111318; padding: 14px; border-radius: 8px; white-space: pre-wrap; line-height: 1.5; border: 1px solid #2b3240; }
+    .meta { font-size: 12px; color: #9ca3af; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>Mini AI</h2>
+    <textarea id="inp" placeholder="Bir kelime veya cumle yaz (orn: selam, yapay zeka)..."></textarea>
+    <button class="btn-gen" onclick="askModel()">Sor / Devamini Uret</button>
+    <button class="btn-train" onclick="teachModel()">Modele Ogret</button>
+    <div class="out" id="out">Model: Hazir. Bir sey yazip butona bas.</div>
+    <div class="meta" id="meta">Karakter havuzu: {{ vocab_len }} | Metin uzunlugu: {{ corpus_len }}</div>
+  </div>
+  <script>
+    async function askModel() {
+      const text = document.getElementById("inp").value;
+      const out = document.getElementById("out");
+      out.textContent = "Model: Uretiliyor...";
+      const res = await fetch("/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: text, temperature: 0.45, top_k: 5, length: 90 })
+      });
+      const data = await res.json();
+      out.textContent = "Model: " + (data.output || data.error || "");
+    }
+
+    async function teachModel() {
+      const text = document.getElementById("inp").value.trim();
+      const out = document.getElementById("out");
+      const meta = document.getElementById("meta");
+      out.textContent = "Model: Egitiliyor ve agirliklar kaydediliyor...";
+      const res = await fetch("/train", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text, epochs: 160 })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        out.textContent = "Model: Ogrenme tamamlandi! En iyi kayip: " + data.best_loss.toFixed(4) + " (" + data.seconds + "s)";
+        meta.textContent = "Karakter havuzu: " + data.vocab_len + " | Metin uzunlugu: " + data.corpus_len;
+      } else {
+        out.textContent = "Hata: " + (data.error || "Egitim basarisiz");
+      }
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/")
+def index():
+    return render_template_string(HTML_PAGE, vocab_len=len(chars), corpus_len=len(corpus_text))
+
+
+@app.post("/generate")
+def api_generate():
+    global Wxh, Whh, Why, bh, by, chars
+    payload = request.get_json(silent=True) or {}
+    prompt_val = payload.get("prompt", "")
+    temp_val = float(payload.get("temperature", 0.45))
+    top_k_val = int(payload.get("top_k", 5))
+    length_val = int(payload.get("length", 90))
+
+    result = generate_continuation(
+        prompt_val,
+        Wxh,
+        Whh,
+        Why,
+        bh,
+        by,
+        chars,
+        length=length_val,
+        temperature=temp_val,
+        top_k=top_k_val,
+    )
+    return jsonify({"output": result})
+
+
+@app.post("/train")
+def api_train():
+    global Wxh, Whh, Why, bh, by, chars, corpus_text
+    payload = request.get_json(silent=True) or {}
+    new_text = (payload.get("text") or "").strip().lower()
+    epochs_val = max(20, min(int(payload.get("epochs", DEFAULT_EPOCHS)), 400))
+
+    if new_text:
+        corpus_text = (corpus_text + "\n" + new_text).strip()
+        save_corpus(corpus_text)
+
+    updated_chars, _, _ = build_vocab_from_text(corpus_text)
+    Wxh, Why, by = expand_weights_if_needed(Wxh, Why, by, chars, updated_chars)
+    chars = updated_chars
+
+    Wxh, Whh, Why, bh, by, best_loss, elapsed = run_training(
+        corpus_text, Wxh, Whh, Why, bh, by, chars, epochs=epochs_val, lr=DEFAULT_LR
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "best_loss": best_loss,
+            "seconds": elapsed,
+            "vocab_len": len(chars),
+            "corpus_len": len(corpus_text),
+        }
+    )
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+    
