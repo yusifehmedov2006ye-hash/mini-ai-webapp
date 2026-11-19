@@ -1,0 +1,8 @@
+force_retrain = os.environ.get("RETRAIN", "0") == "1"
+
+if force_retrain:
+    Wxh, Whh, Why, bh, by = train_model(epochs=EPOCHS, lr=LEARNING_RATE)
+elif weights_exist():
+    Wxh, Whh, Why, bh, by = load_model()
+else:
+    Wxh, Whh, Why, bh, by = train_model(epochs=EPOCHS, lr=LEARNING_RATE)
